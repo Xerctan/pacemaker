@@ -56,7 +56,7 @@ jobs:
         run: |
           set -uo pipefail
           API=https://api.instabox.sh
-          M=m_agquf47fnybmaewlqsuhlhft3m      # instabox machine "kael": Kael + the DSH harness
+          M=m_agqvosbzhe4onajahzt4ptqeli      # instabox machine "kael": Kael + the DSH harness
           if [ -z "${INSTABOX_API_KEY:-}" ]; then
             echo "INSTABOX_API_KEY is not set as a repo secret — nothing to do."
             exit 1
