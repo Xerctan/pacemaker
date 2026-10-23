@@ -1,0 +1,121 @@
+# Pacemaker — keeps raffy's instabox machine from pausing itself.
+#
+# instabox pauses a sandbox after **30 minutes idle** and the API gives no way to
+# turn that off: `autoSuspendAfterSeconds: 86400` is accepted and ignored (the
+# machine still reports 1800), `onTimeout` accepts only "pause" or "kill", and
+# `metadata.always_on` does nothing. A paused machine runs nothing, so nothing on
+# the box can wake it, and a visit to its public URL does NOT wake it either (a
+# suspended machine answers 503 and stays suspended — tested 2026-10-16). Only the
+# API can:
+#   * a read  (GET /v1/machines/{id}) while running resets the idle timer
+#   * a resume (POST /v1/machines/{id}/resume) brings it back in ~5 seconds, with
+#     pause/resume transparent to what is inside (systemd never notices)
+#
+# **Why this holds a run open for five hours (2026-10-18).** The schedule below is
+# every five minutes, but GitHub was only actually *starting* this workflow every
+# two to three hours (measured from the run history: 21:29, 23:20, then over an
+# hour with nothing). A run that pokes once and exits therefore left the box asleep
+# for most of the day. So one run now pokes once, sleeps five minutes, and repeats
+# for five hours. Even if GitHub starts a run only every few hours, coverage stays
+# continuous; a queued run replaces the older pending one, so they cannot pile up.
+#
+# This repo is PUBLIC on purpose: scheduled workflows in public repos do not spend
+# the 2,000 monthly Actions minutes a private repo gets, and a five-hour job would
+# eat a private repo's whole allowance in a day. It holds no secrets except the
+# repo secret INSTABOX_API_KEY, which workflow runs can read and nobody else can.
+#
+# Same job also lives in the private vault repo (raffyfatlly/claude) as a slower
+# one-shot backstop. Background: notes/dsh-moved-house-to-instabox.md in that repo.
+name: Pacemaker
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pacemaker
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  poke:
+    runs-on: ubuntu-latest
+    # 60 pokes x 5 minutes = 5 hours, inside the 6-hour ceiling for a job with
+    # room to spare. See the note at the top for why it does not exit early.
+    timeout-minutes: 350
+    steps:
+      # Needed only by the stamp step below; the poke itself is a plain API call.
+      - uses: actions/checkout@v4
+
+      - name: Poke the machine every five minutes, for five hours
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+        run: |
+          set -uo pipefail
+          API=https://api.instabox.sh
+          M=m_agqvosbzhe4onajahzt4ptqeli
+          if [ -z "${INSTABOX_API_KEY:-}" ]; then
+            echo "INSTABOX_API_KEY is not set as a repo secret — nothing to do."
+            exit 1
+          fi
+
+          poke() {
+            local state
+            state=$(curl -sS --max-time 30 -H "Authorization: Bearer $INSTABOX_API_KEY" \
+              "$API/v1/machines/$M" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","unknown"))' 2>/dev/null) \
+              || state="unreachable"
+            echo "$(date -u +%H:%M:%S) machine state: $state"
+            case "$state" in
+              running)
+                : # the read above is itself the poke that resets the idle timer
+                ;;
+              suspended|paused)
+                echo "  asleep — resuming"
+                curl -sS --max-time 60 -X POST -H "Authorization: Bearer $INSTABOX_API_KEY" \
+                  -H "Idempotency-Key: gh-resume-$GITHUB_RUN_ID-$1" "$API/v1/machines/$M/resume" || true
+                ;;
+              stopped)
+                echo "  stopped — starting"
+                curl -sS --max-time 60 -X POST -H "Authorization: Bearer $INSTABOX_API_KEY" \
+                  -H "Idempotency-Key: gh-start-$GITHUB_RUN_ID-$1" "$API/v1/machines/$M/start" || true
+                ;;
+              *)
+                # A transient API failure must not end the five hours of pokes,
+                # so this is reported and the loop carries on.
+                echo "  unexpected state '$state' — will try again next tick"
+                ;;
+            esac
+          }
+
+          for i in $(seq 1 60); do
+            poke "$i"
+            if [ "$i" -lt 60 ]; then
+              sleep 300
+            fi
+          done
+          echo "five hours of pokes done; the next scheduled run takes over."
+
+      # GitHub disables scheduled workflows in a repo with no activity for 60 days,
+      # and this one is quiet by design. A timestamp commit once a day is the
+      # cheapest way to keep it alive. Pushes made with GITHUB_TOKEN do not trigger
+      # workflow runs, so this cannot feed itself. `always()` because a cancelled
+      # run should still leave the stamp behind.
+      - name: Keep this workflow from being disabled for inactivity
+        if: always()
+        run: |
+          set -euo pipefail
+          today=$(date -u +%Y-%m-%d)
+          if [ "$(cat last-poke.txt 2>/dev/null || echo none)" = "$today" ]; then
+            echo "already stamped today"
+            exit 0
+          fi
+          echo "$today" > last-poke.txt
+          git config user.name "pacemaker"
+          git config user.email "pacemaker@users.noreply.github.com"
+          git add last-poke.txt
+          git commit -m "pacemaker alive: $today"
+          git push
